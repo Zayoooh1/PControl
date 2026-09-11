@@ -11,6 +11,55 @@ public static class PControlWindowTest {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, Visitor visitor, IntPtr data);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr window, uint msg, IntPtr wparam, StringBuilder text, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window, StringBuilder name, int count);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr window, int index);
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wparam, IntPtr lparam);
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address, UIntPtr size, uint allocation, uint protection);
+    [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
+    [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] buffer, int size, out IntPtr written);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [StructLayout(LayoutKind.Sequential)] struct LVITEM {
+        public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask;
+        public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam; public int iIndent;
+        public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
+    }
+    static IntPtr ProcessList(uint pid) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, data) => { uint owner; GetWindowThreadProcessId(window, out owner);
+            if (owner == pid) EnumChildWindows(window, (child, unused) => {
+                var name = new StringBuilder(64); GetClassName(child, name, 64);
+                if (name.ToString() == "SysListView32" && (GetWindowLong(child, -16) & 3) == 1) result = child;
+                return true;
+            }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        if (result == IntPtr.Zero) throw new InvalidOperationException("Process list view not found");
+        return result;
+    }
+    public static int ItemCount(uint pid) { return SendMessage(ProcessList(pid), 0x1004, IntPtr.Zero, IntPtr.Zero).ToInt32(); }
+    public static int TopIndex(uint pid) { return SendMessage(ProcessList(pid), 0x1027, IntPtr.Zero, IntPtr.Zero).ToInt32(); }
+    public static int SelectedIndex(uint pid) { return SendMessage(ProcessList(pid), 0x100c, new IntPtr(-1), new IntPtr(2)).ToInt32(); }
+    public static int ScrollTo(uint pid, int index) {
+        SendMessage(ProcessList(pid), 0x1013, new IntPtr(index), IntPtr.Zero);
+        return TopIndex(pid);
+    }
+    public static void Select(uint pid, int index) {
+        var process = OpenProcess(0x0008 | 0x0020, false, pid);
+        if (process == IntPtr.Zero) throw new InvalidOperationException("OpenProcess for list selection failed");
+        int size = Marshal.SizeOf(typeof(LVITEM));
+        var remote = VirtualAllocEx(process, IntPtr.Zero, (UIntPtr)size, 0x1000 | 0x2000, 0x04);
+        try {
+            var item = new LVITEM { state = 3, stateMask = 3 };
+            var local = Marshal.AllocHGlobal(size);
+            try {
+                Marshal.StructureToPtr(item, local, false); var bytes = new byte[size]; Marshal.Copy(local, bytes, 0, size);
+                IntPtr written; if (!WriteProcessMemory(process, remote, bytes, size, out written) || written.ToInt64() != size)
+                    throw new InvalidOperationException("WriteProcessMemory for list selection failed");
+            } finally { Marshal.FreeHGlobal(local); }
+            SendMessage(ProcessList(pid), 0x102b, new IntPtr(index), remote);
+        } finally { if (remote != IntPtr.Zero) VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000); CloseHandle(process); }
+    }
     public static bool HasStatus(uint pid, string expected) {
         bool found = false;
         EnumWindows((window, data) => { uint owner; GetWindowThreadProcessId(window, out owner);
@@ -106,7 +155,7 @@ try {
     $initial = Wait-Core
     $coreId = $initial.data.pid
     Assert-Test ($coreId -gt 0) 'GUI auto-starts separate Core'
-    Start-Sleep -Milliseconds 700
+    Start-Sleep -Milliseconds 1800
     $gui.Refresh()
     Assert-Test (-not $gui.HasExited -and [PControlWindowTest]::Exists($gui.Id)) 'GUI window created'
     Assert-Test ([PControlWindowTest]::HasStatus($gui.Id, 'Core: Running')) 'GUI shows Running status and answers window messages'
@@ -130,6 +179,31 @@ try {
     for ($i=0; $i -lt 100; $i++) { $null = Invoke-Core @{command='Ping'} }
     $afterHandles = (Get-Process -Id $coreId).HandleCount
     Assert-Test ($afterHandles -le $beforeHandles + 8) "No linear handle growth across 100 requests ($beforeHandles -> $afterHandles)"
+    Start-Sleep -Milliseconds 1800
+    $beforeRows = @((Invoke-Core @{command='GetProcessList'}).data)
+    Assert-Test ($beforeRows.Count -eq [PControlWindowTest]::ItemCount($gui.Id)) 'GUI list reflects sorted Core snapshot'
+    $desiredTop = [Math]::Max(1, [Math]::Floor($beforeRows.Count / 2))
+    $oldTop = [PControlWindowTest]::ScrollTo($gui.Id, $desiredTop)
+    $topIdentity = $beforeRows[$oldTop]
+    $oldSelected = [Math]::Min($oldTop + 2, $beforeRows.Count - 1)
+    $selectedIdentity = $beforeRows[$oldSelected]
+    [PControlWindowTest]::Select($gui.Id, $oldSelected)
+    Assert-Test ([PControlWindowTest]::SelectedIndex($gui.Id) -eq $oldSelected) 'Runtime test selects a process low in the list'
+    $scrollTargetPath = Join-Path $testRoot '000-PControl-Scroll.exe'
+    Copy-Item -LiteralPath $targetPath -Destination $scrollTargetPath
+    $scrollTarget = Start-Owned $scrollTargetPath
+    $null = Find-Target $scrollTarget.Id
+    Start-Sleep -Milliseconds 2200
+    $afterRows = @((Invoke-Core @{command='GetProcessList'}).data)
+    $newTop = 0
+    while ($newTop -lt $afterRows.Count -and
+           ($afterRows[$newTop].pid -ne $topIdentity.pid -or $afterRows[$newTop].creationTime -ne $topIdentity.creationTime)) { $newTop++ }
+    $newSelected = 0
+    while ($newSelected -lt $afterRows.Count -and
+           ($afterRows[$newSelected].pid -ne $selectedIdentity.pid -or $afterRows[$newSelected].creationTime -ne $selectedIdentity.creationTime)) { $newSelected++ }
+    Assert-Test ($newTop -lt $afterRows.Count -and [PControlWindowTest]::TopIndex($gui.Id) -eq $newTop) 'Top-visible process identity survives refresh and insertion'
+    Assert-Test ($newSelected -lt $afterRows.Count -and [PControlWindowTest]::SelectedIndex($gui.Id) -eq $newSelected) 'Selected process identity survives refresh and insertion'
+    Stop-Process -Id $scrollTarget.Id
     $target = Start-Owned $targetPath
     $row = Find-Target $target.Id
     Assert-Test ($row.creationTime -ne '0') 'New process has creation identity'

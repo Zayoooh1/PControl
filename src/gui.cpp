@@ -1,4 +1,5 @@
 #include "ipc.hpp"
+#include <algorithm>
 #include <atomic>
 #include <commctrl.h>
 #include <memory>
@@ -119,6 +120,35 @@ Json selected() {
         throw pc::Error(ERROR_INVALID_PARAMETER, "Select a process first");
     return rows[index];
 }
+bool sameProcess(const Json &left, const Json &right) {
+    if (left.is_null() || right.is_null())
+        return false;
+    const auto leftCreation = left.value("creationTime", "");
+    const auto rightCreation = right.value("creationTime", "");
+    return leftCreation != "0" && !leftCreation.empty() && leftCreation == rightCreation &&
+           left.value("pid", DWORD{}) == right.value("pid", DWORD{});
+}
+int findProcess(const Json &identity) {
+    if (identity.is_null())
+        return -1;
+    for (int index = 0; index < static_cast<int>(rows.size()); ++index)
+        if (sameProcess(rows[index], identity))
+            return index;
+    return -1;
+}
+void restoreTopProcess(const Json &identity, int fallbackIndex) {
+    int count = ListView_GetItemCount(list);
+    if (!count)
+        return;
+    int target = findProcess(identity);
+    if (target < 0)
+        target = std::clamp(fallbackIndex, 0, count - 1);
+    ListView_EnsureVisible(list, target, FALSE);
+    int currentTop = ListView_GetTopIndex(list);
+    RECT row{};
+    if (ListView_GetItemRect(list, target, &row, LVIR_BOUNDS))
+        ListView_Scroll(list, 0, (target - currentTop) * (row.bottom - row.top));
+}
 void selection() {
     try {
         auto p = selected();
@@ -167,12 +197,15 @@ void update() {
          std::to_wstring(st.at("intervalMs").get<int>()) + L" ms" +
          (st.at("configHealthy").get<bool>() ? L"" : L" | CONFIG ERROR: repair config.json and reload"))
             .c_str());
-    Json old;
+    Json oldSelection;
     try {
-        old = selected();
+        oldSelection = selected();
     } catch (...) {
     }
-    int top = ListView_GetTopIndex(list);
+    int oldTopIndex = ListView_GetTopIndex(list);
+    Json oldTopProcess;
+    if (oldTopIndex >= 0 && oldTopIndex < static_cast<int>(rows.size()))
+        oldTopProcess = rows[oldTopIndex];
     rows = out.at("rows").at("data");
     SendMessageW(list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(list);
@@ -194,13 +227,13 @@ void update() {
                                            pc::wide(p.value("path", ""))};
         for (int c = 0; c < (int)cells.size(); ++c)
             ListView_SetItemText(list, index, c + 1, cells[c].data());
-        if (!old.is_null() && p.at("pid") == old.at("pid") && p.at("creationTime") == old.at("creationTime"))
-            ListView_SetItemState(list, index, LVIS_SELECTED, LVIS_SELECTED);
         ++index;
     }
-    RECT firstRow{};
-    if (ListView_GetItemRect(list, 0, &firstRow, LVIR_BOUNDS))
-        ListView_Scroll(list, 0, top * (firstRow.bottom - firstRow.top));
+    int selectedIndex = findProcess(oldSelection);
+    if (selectedIndex >= 0)
+        ListView_SetItemState(list, selectedIndex, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+    restoreTopProcess(oldTopProcess, oldTopIndex);
     SendMessageW(list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(list, nullptr, TRUE);
     configuration = out.at("config").at("data");

@@ -73,6 +73,41 @@ int main() {
         }
         auto all = pc::enumerate();
         require(!all.empty(), "Process enumeration");
+        require(all.front().contains("isWindowsSystemProcess"), "System classification included in model");
+        require(!pc::isWindowsSystemProcess(L"C:\\Program Files\\Vendor\\App.exe", L"App.exe", 100,
+                                            L"C:\\Windows"),
+                "Program Files application is ordinary");
+        require(!pc::isWindowsSystemProcess(L"C:\\Users\\Test\\AppData\\Local\\App.exe", L"App.exe", 101,
+                                            L"C:\\Windows"),
+                "LocalAppData application is ordinary");
+        require(pc::isWindowsSystemProcess(L"C:\\WINDOWS\\System32\\svchost.exe", L"svchost.exe", 102,
+                                           L"c:/windows/"),
+                "Windows directory comparison is case-insensitive");
+        require(
+            pc::isWindowsSystemProcess(L"C:\\Windows\\explorer.exe", L"explorer.exe", 106, L"C:\\Windows"),
+            "Explorer follows the Windows path rule");
+        require(!pc::isWindowsSystemProcess(L"C:\\WindowsFake\\App.exe", L"App.exe", 103, L"C:\\Windows"),
+                "Similar path prefix is ordinary");
+        require(pc::isWindowsSystemProcess(L"", L"System", 4, L"C:\\Windows"), "PID 4 System fallback");
+        require(pc::isWindowsSystemProcess(L"", L"Registry", 104, L"C:\\Windows"), "Registry fallback");
+        require(pc::isWindowsSystemProcess(L"", L"SVCHOST.EXE", 105, L"C:\\Windows"),
+                "Known Windows executable fallback is case-insensitive");
+        auto sorted =
+            pc::Json::array({{{"pid", 9}, {"name", "zeta.exe"}, {"isWindowsSystemProcess", false}},
+                             {{"pid", 7}, {"name", "SVCHOST.exe"}, {"isWindowsSystemProcess", true}},
+                             {{"pid", 4}, {"name", "alpha.exe"}, {"isWindowsSystemProcess", false}},
+                             {{"pid", 3}, {"name", "Alpha.exe"}, {"isWindowsSystemProcess", false}},
+                             {{"pid", 2}, {"name", "csrss.exe"}, {"isWindowsSystemProcess", true}}});
+        pc::sortProcessRows(sorted);
+        require(sorted[0]["pid"] == 3 && sorted[1]["pid"] == 4 && sorted[2]["pid"] == 9 &&
+                    sorted[3]["pid"] == 2 && sorted[4]["pid"] == 7,
+                "Rows sort by group, case-insensitive name, then PID");
+        bool reachedSystemGroup = false;
+        for (const auto &process : all) {
+            bool system = process.at("isWindowsSystemProcess");
+            require(!reachedSystemGroup || system, "Enumerated user processes stay above Windows processes");
+            reachedSystemGroup = reachedSystemGroup || system;
+        }
         DWORD pid = GetCurrentProcessId();
         uint64_t id = pc::creation(GetCurrentProcess());
         auto d = pc::details(pid, id);
