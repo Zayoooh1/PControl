@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 namespace {
 using pc::Json;
@@ -32,6 +33,13 @@ Json workerResult;
 bool rendering = false;
 bool closing = false;
 bool connected = false;
+struct PresentationIdentity {
+    DWORD pid = 0;
+    std::string creationTime;
+    std::string name;
+    std::string path;
+};
+std::optional<PresentationIdentity> selectedProcess;
 const wchar_t *priorityNames[] = {L"Idle",         L"Below Normal", L"Normal",
                                   L"Above Normal", L"High",         L"Real Time"};
 const DWORD priorityValues[] = {0x40, 0x4000, 0x20, 0x8000, 0x80, 0x100};
@@ -120,38 +128,82 @@ Json selected() {
         throw pc::Error(ERROR_INVALID_PARAMETER, "Select a process first");
     return rows[index];
 }
-bool sameProcess(const Json &left, const Json &right) {
-    if (left.is_null() || right.is_null())
-        return false;
-    const auto leftCreation = left.value("creationTime", "");
-    const auto rightCreation = right.value("creationTime", "");
-    return leftCreation != "0" && !leftCreation.empty() && leftCreation == rightCreation &&
-           left.value("pid", DWORD{}) == right.value("pid", DWORD{});
+PresentationIdentity presentationIdentity(const Json &process) {
+    return {process.value("pid", DWORD{}), process.value("creationTime", ""), process.value("name", ""),
+            process.value("path", "")};
 }
-int findProcess(const Json &identity) {
-    if (identity.is_null())
-        return -1;
+bool samePresentationProcess(const PresentationIdentity &left, const PresentationIdentity &right) {
+    if (left.pid != right.pid)
+        return false;
+    if (!left.creationTime.empty() && left.creationTime != "0" && !right.creationTime.empty() &&
+        right.creationTime != "0")
+        return left.creationTime == right.creationTime;
+    return left.creationTime == "0" && right.creationTime == "0" &&
+           CompareStringOrdinal(pc::wide(left.name).c_str(), -1, pc::wide(right.name).c_str(), -1, TRUE) ==
+               CSTR_EQUAL &&
+           CompareStringOrdinal(pc::wide(left.path).c_str(), -1, pc::wide(right.path).c_str(), -1, TRUE) ==
+               CSTR_EQUAL;
+}
+int findProcess(const PresentationIdentity &identity) {
     for (int index = 0; index < static_cast<int>(rows.size()); ++index)
-        if (sameProcess(rows[index], identity))
+        if (samePresentationProcess(presentationIdentity(rows[index]), identity))
             return index;
     return -1;
 }
-void restoreTopProcess(const Json &identity, int fallbackIndex) {
+bool sameStructure(const Json &oldRows, const Json &newRows) {
+    if (oldRows.size() != newRows.size())
+        return false;
+    for (size_t index = 0; index < oldRows.size(); ++index)
+        if (!samePresentationProcess(presentationIdentity(oldRows[index]),
+                                     presentationIdentity(newRows[index])))
+            return false;
+    return true;
+}
+std::vector<std::wstring> cells(const Json &process) {
+    return {pc::wide(process.value("name", "")),
+            std::to_wstring(process.value("pid", DWORD{})),
+            priorityLabel(process.value("priority", 0u)),
+            pc::wide(process.value("affinityMask", "0")),
+            pc::wide(process.value("architecture", "Unknown")),
+            process.value("accessError", 0u)
+                ? L"Win32 " + std::to_wstring(process.value("accessError", DWORD{}))
+                : L"Accessible",
+            pc::wide(process.value("path", ""))};
+}
+void updateRowsInPlace(const Json &newRows) {
+    rendering = true;
+    for (int row = 0; row < static_cast<int>(rows.size()); ++row) {
+        auto before = cells(rows[row]);
+        auto after = cells(newRows[row]);
+        for (int column = 0; column < static_cast<int>(after.size()); ++column)
+            if (before[column] != after[column])
+                ListView_SetItemText(list, row, column, after[column].data());
+    }
+    rows = newRows;
+    rendering = false;
+}
+void restoreTopProcess(const PresentationIdentity &identity, int fallbackIndex, int pixelOffset) {
     int count = ListView_GetItemCount(list);
     if (!count)
         return;
     int target = findProcess(identity);
     if (target < 0)
         target = std::clamp(fallbackIndex, 0, count - 1);
-    ListView_EnsureVisible(list, target, FALSE);
     int currentTop = ListView_GetTopIndex(list);
-    RECT row{};
-    if (ListView_GetItemRect(list, target, &row, LVIR_BOUNDS))
-        ListView_Scroll(list, 0, (target - currentTop) * (row.bottom - row.top));
+    RECT visibleRow{};
+    if (!ListView_GetItemRect(list, currentTop, &visibleRow, LVIR_BOUNDS))
+        return;
+    int rowHeight = visibleRow.bottom - visibleRow.top;
+    ListView_Scroll(list, 0, (target - currentTop) * rowHeight + visibleRow.top - pixelOffset);
+    RECT restoredRow{};
+    if (ListView_GetItemRect(list, target, &restoredRow, LVIR_BOUNDS) && restoredRow.top != pixelOffset)
+        ListView_Scroll(list, 0, restoredRow.top - pixelOffset);
 }
 void selection() {
     try {
         auto p = selected();
+        if (!rendering)
+            selectedProcess = presentationIdentity(p);
         SetWindowTextW(detail, pc::wide(p.at("name").get<std::string>() + " | " + p.value("path", "") +
                                         " | creation=" + p.at("creationTime").get<std::string>())
                                    .c_str());
@@ -164,6 +216,8 @@ void selection() {
         for (int i = 0; i < ListView_GetItemCount(cpus); ++i)
             ListView_SetCheckState(cpus, i, (mask & (uint64_t(1) << i)) != 0);
     } catch (...) {
+        if (!rendering)
+            selectedProcess.reset();
     }
 }
 void update() {
@@ -188,7 +242,6 @@ void update() {
                                        .c_str());
             return;
         }
-    rendering = true;
     connected = true;
     auto st = out.at("status").at("data");
     SetWindowTextW(
@@ -197,45 +250,52 @@ void update() {
          std::to_wstring(st.at("intervalMs").get<int>()) + L" ms" +
          (st.at("configHealthy").get<bool>() ? L"" : L" | CONFIG ERROR: repair config.json and reload"))
             .c_str());
-    Json oldSelection;
-    try {
-        oldSelection = selected();
-    } catch (...) {
+    const Json newRows = out.at("rows").at("data");
+    if (sameStructure(rows, newRows)) {
+        updateRowsInPlace(newRows);
+    } else {
+        int oldTopIndex = ListView_GetTopIndex(list);
+        int oldTopOffset = 0;
+        std::optional<PresentationIdentity> oldTopProcess;
+        RECT oldTopRect{};
+        if (oldTopIndex >= 0 && oldTopIndex < static_cast<int>(rows.size())) {
+            oldTopProcess = presentationIdentity(rows[oldTopIndex]);
+            if (ListView_GetItemRect(list, oldTopIndex, &oldTopRect, LVIR_BOUNDS))
+                oldTopOffset = oldTopRect.top;
+        }
+
+        rendering = true;
+        rows = newRows;
+        SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+        ListView_DeleteAllItems(list);
+        int index = 0;
+        for (const auto &process : rows) {
+            auto values = cells(process);
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = index;
+            item.pszText = values[0].data();
+            ListView_InsertItem(list, &item);
+            for (int column = 1; column < static_cast<int>(values.size()); ++column)
+                ListView_SetItemText(list, index, column, values[column].data());
+            ++index;
+        }
+
+        int selectedIndex = selectedProcess ? findProcess(*selectedProcess) : -1;
+        if (selectedIndex >= 0) {
+            ListView_SetItemState(list, selectedIndex, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetSelectionMark(list, selectedIndex);
+        } else if (selectedProcess) {
+            selectedProcess.reset();
+            SetWindowTextW(detail, L"The selected process has ended.");
+        }
+        if (oldTopProcess)
+            restoreTopProcess(*oldTopProcess, oldTopIndex, oldTopOffset);
+        SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(list, nullptr, TRUE);
+        rendering = false;
     }
-    int oldTopIndex = ListView_GetTopIndex(list);
-    Json oldTopProcess;
-    if (oldTopIndex >= 0 && oldTopIndex < static_cast<int>(rows.size()))
-        oldTopProcess = rows[oldTopIndex];
-    rows = out.at("rows").at("data");
-    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(list);
-    int index = 0;
-    for (const auto &p : rows) {
-        auto name = pc::wide(p.at("name"));
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = index;
-        item.pszText = name.data();
-        ListView_InsertItem(list, &item);
-        std::vector<std::wstring> cells = {std::to_wstring(p.at("pid").get<DWORD>()),
-                                           priorityLabel(p.value("priority", 0u)),
-                                           pc::wide(p.value("affinityMask", "0")),
-                                           pc::wide(p.value("architecture", "Unknown")),
-                                           p.value("accessError", 0u)
-                                               ? L"Win32 " + std::to_wstring(p.at("accessError").get<DWORD>())
-                                               : L"Accessible",
-                                           pc::wide(p.value("path", ""))};
-        for (int c = 0; c < (int)cells.size(); ++c)
-            ListView_SetItemText(list, index, c + 1, cells[c].data());
-        ++index;
-    }
-    int selectedIndex = findProcess(oldSelection);
-    if (selectedIndex >= 0)
-        ListView_SetItemState(list, selectedIndex, LVIS_SELECTED | LVIS_FOCUSED,
-                              LVIS_SELECTED | LVIS_FOCUSED);
-    restoreTopProcess(oldTopProcess, oldTopIndex);
-    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(list, nullptr, TRUE);
     configuration = out.at("config").at("data");
     std::wstring r = L"Persistent rules (exact executable name)\r\n";
     for (const auto &key : {"priorityRules", "affinityRules"})
@@ -243,7 +303,6 @@ void update() {
             r += pc::wide(rule.at("name")) + L"  / " + pc::wide(key) + L"  / " +
                  pc::wide(rule.at("value").dump()) + L"\r\n";
     SetWindowTextW(rules, r.c_str());
-    rendering = false;
     if (out.contains("action")) {
         auto a = out.at("action");
         if (!a.value("success", false))
@@ -356,7 +415,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         status = control(L"STATIC", L"Core: Connecting...", 0, 0);
         control(L"BUTTON", L"Connect / start", BS_PUSHBUTTON, Reconnect);
         control(L"BUTTON", L"Reload config", BS_PUSHBUTTON, Reload);
-        list = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, Processes);
+        list = control(WC_LISTVIEWW, L"",
+                       LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, Processes);
         ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
         const wchar_t *labels[] = {L"Process",      L"PID",    L"Priority",       L"Affinity mask",
                                    L"Architecture", L"Access", L"Executable path"};

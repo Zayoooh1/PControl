@@ -18,7 +18,13 @@ public static class PControlWindowTest {
     [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address, UIntPtr size, uint allocation, uint protection);
     [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
     [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] buffer, int size, out IntPtr written);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, int size, out IntPtr read);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint attach, uint attachTo, bool enable);
+    [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr window);
+    [DllImport("user32.dll")] static extern IntPtr GetFocus();
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
     [StructLayout(LayoutKind.Sequential)] struct LVITEM {
         public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask;
         public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam; public int iIndent;
@@ -37,12 +43,80 @@ public static class PControlWindowTest {
         if (result == IntPtr.Zero) throw new InvalidOperationException("Process list view not found");
         return result;
     }
+    static IntPtr ChildByClass(uint pid, string expected) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, data) => { uint owner; GetWindowThreadProcessId(window, out owner);
+            if (owner == pid) EnumChildWindows(window, (child, unused) => {
+                var name = new StringBuilder(64); GetClassName(child, name, 64);
+                if (name.ToString() == expected && result == IntPtr.Zero) result = child;
+                return true;
+            }, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        if (result == IntPtr.Zero) throw new InvalidOperationException(expected + " control not found");
+        return result;
+    }
     public static int ItemCount(uint pid) { return SendMessage(ProcessList(pid), 0x1004, IntPtr.Zero, IntPtr.Zero).ToInt32(); }
     public static int TopIndex(uint pid) { return SendMessage(ProcessList(pid), 0x1027, IntPtr.Zero, IntPtr.Zero).ToInt32(); }
     public static int SelectedIndex(uint pid) { return SendMessage(ProcessList(pid), 0x100c, new IntPtr(-1), new IntPtr(2)).ToInt32(); }
+    public static string ItemText(uint pid, int index, int column) {
+        var process = OpenProcess(0x0008 | 0x0010 | 0x0020, false, pid);
+        if (process == IntPtr.Zero) throw new InvalidOperationException("OpenProcess for item text failed");
+        int itemSize = Marshal.SizeOf(typeof(LVITEM)); int textBytes = 2048;
+        var remote = VirtualAllocEx(process, IntPtr.Zero, (UIntPtr)(itemSize + textBytes), 0x1000 | 0x2000, 0x04);
+        try {
+            var item = new LVITEM { iSubItem = column, pszText = new IntPtr(remote.ToInt64() + itemSize), cchTextMax = textBytes / 2 };
+            var local = Marshal.AllocHGlobal(itemSize);
+            try {
+                Marshal.StructureToPtr(item, local, false); var bytes = new byte[itemSize]; Marshal.Copy(local, bytes, 0, itemSize);
+                IntPtr transferred; if (!WriteProcessMemory(process, remote, bytes, itemSize, out transferred))
+                    throw new InvalidOperationException("Write item request failed");
+            } finally { Marshal.FreeHGlobal(local); }
+            SendMessage(ProcessList(pid), 0x1073, new IntPtr(index), remote);
+            var text = new byte[textBytes]; IntPtr read;
+            if (!ReadProcessMemory(process, new IntPtr(remote.ToInt64() + itemSize), text, textBytes, out read))
+                throw new InvalidOperationException("Read item text failed");
+            string value = Encoding.Unicode.GetString(text); int zero = value.IndexOf('\0');
+            return zero >= 0 ? value.Substring(0, zero) : value;
+        } finally { if (remote != IntPtr.Zero) VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000); CloseHandle(process); }
+    }
     public static int ScrollTo(uint pid, int index) {
         SendMessage(ProcessList(pid), 0x1013, new IntPtr(index), IntPtr.Zero);
         return TopIndex(pid);
+    }
+    public static int ItemTop(uint pid, int index) {
+        var process = OpenProcess(0x0008 | 0x0010 | 0x0020, false, pid);
+        if (process == IntPtr.Zero) throw new InvalidOperationException("OpenProcess for row rectangle failed");
+        var remote = VirtualAllocEx(process, IntPtr.Zero, (UIntPtr)16, 0x1000 | 0x2000, 0x04);
+        try {
+            var bytes = new byte[16]; IntPtr transferred;
+            if (!WriteProcessMemory(process, remote, bytes, 16, out transferred)) throw new InvalidOperationException("Write row rectangle failed");
+            SendMessage(ProcessList(pid), 0x100e, new IntPtr(index), remote);
+            if (!ReadProcessMemory(process, remote, bytes, 16, out transferred)) throw new InvalidOperationException("Read row rectangle failed");
+            return BitConverter.ToInt32(bytes, 4);
+        } finally { if (remote != IntPtr.Zero) VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000); CloseHandle(process); }
+    }
+    public static int TopOffset(uint pid) { return ItemTop(pid, TopIndex(pid)); }
+    public static int ScrollToTop(uint pid, int index) {
+        var list = ProcessList(pid);
+        SendMessage(list, 0x1013, new IntPtr(index), IntPtr.Zero);
+        int delta = ItemTop(pid, index) - TopOffset(pid);
+        SendMessage(list, 0x1014, IntPtr.Zero, new IntPtr(delta));
+        return TopIndex(pid);
+    }
+    public static bool HasShowSelectionAlways(uint pid) { return (GetWindowLong(ProcessList(pid), -16) & 8) != 0; }
+    public static bool FocusPriority(uint pid) {
+        IntPtr main = IntPtr.Zero; uint targetThread = 0;
+        EnumWindows((window, data) => { uint owner; uint thread = GetWindowThreadProcessId(window, out owner);
+            if (owner == pid) { var title = new StringBuilder(256); GetWindowText(window, title, 256);
+                if (title.ToString() == "PControl") { main = window; targetThread = thread; } }
+            return true;
+        }, IntPtr.Zero);
+        var combo = ChildByClass(pid, "ComboBox");
+        uint current = GetCurrentThreadId();
+        if (!AttachThreadInput(current, targetThread, true)) return false;
+        try { SetForegroundWindow(main); SetFocus(combo); return GetFocus() == combo; }
+        finally { AttachThreadInput(current, targetThread, false); }
     }
     public static void Select(uint pid, int index) {
         var process = OpenProcess(0x0008 | 0x0020, false, pid);
@@ -129,8 +203,9 @@ function Invoke-Core([hashtable]$message, [string]$Raw = '') {
         return $reply
     } finally { $pipe.Dispose() }
 }
-function Start-Owned([string]$path) {
-    $process = Start-Process -FilePath $path -WindowStyle Hidden -PassThru
+function Start-Owned([string]$path, [switch]$Visible) {
+    $process = if ($Visible) { Start-Process -FilePath $path -PassThru }
+               else { Start-Process -FilePath $path -WindowStyle Hidden -PassThru }
     $owned.Add($process)
     return $process
 }
@@ -150,6 +225,23 @@ function Find-Target([int]$targetId) {
     }
     throw 'Target not detected'
 }
+function Identity-Key($row) { return "$($row.pid)|$($row.creationTime)" }
+function Snapshot-Key($items) { return (($items | ForEach-Object { Identity-Key $_ }) -join ';') }
+function Assert-Anchors([Diagnostics.Process]$guiProcess, [int]$anchorPid, [string]$anchorName, [string]$anchorPath, [int]$topOffset, [string]$label) {
+    $currentTop = [PControlWindowTest]::TopIndex($guiProcess.Id)
+    $currentSelected = [PControlWindowTest]::SelectedIndex($guiProcess.Id)
+    $currentOffset = [PControlWindowTest]::TopOffset($guiProcess.Id)
+    $topPid = if ($currentTop -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentTop, 1) } else { '<none>' }
+    $selectedPid = if ($currentSelected -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentSelected, 1) } else { '<none>' }
+    $topName = if ($currentTop -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentTop, 0) } else { '<none>' }
+    $selectedName = if ($currentSelected -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentSelected, 0) } else { '<none>' }
+    $topPath = if ($currentTop -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentTop, 6) } else { '<none>' }
+    $selectedPath = if ($currentSelected -ge 0) { [PControlWindowTest]::ItemText($guiProcess.Id, $currentSelected, 6) } else { '<none>' }
+    $matches = $topPid -eq "$anchorPid" -and $selectedPid -eq "$anchorPid" -and
+               $topName -eq $anchorName -and $selectedName -eq $anchorName -and
+               $topPath -eq $anchorPath -and $selectedPath -eq $anchorPath
+    Assert-Test ($matches -and $currentOffset -eq $topOffset) "$label (topPid=$topPid selectedPid=$selectedPid offset=$topOffset/$currentOffset)"
+}
 try {
     $gui = Start-Owned $guiPath
     $initial = Wait-Core
@@ -163,7 +255,7 @@ try {
     Assert-Test ($duplicate.WaitForExit(5000) -and $duplicate.ExitCode -eq 0) 'Second Core exits cleanly'
     Stop-Process -Id $gui.Id
     Assert-Test ((Invoke-Core @{command='Ping'}).data.pid -eq $coreId) 'Core survives GUI termination'
-    $gui = Start-Owned $guiPath
+    $gui = Start-Owned $guiPath -Visible
     Start-Sleep -Milliseconds 700
     Assert-Test ((Invoke-Core @{command='Ping'}).data.pid -eq $coreId) 'GUI restart reuses Core'
     Assert-Test (-not (Invoke-Core @{command='Ping';version=999}).success) 'Protocol mismatch rejected'
@@ -179,31 +271,80 @@ try {
     for ($i=0; $i -lt 100; $i++) { $null = Invoke-Core @{command='Ping'} }
     $afterHandles = (Get-Process -Id $coreId).HandleCount
     Assert-Test ($afterHandles -le $beforeHandles + 8) "No linear handle growth across 100 requests ($beforeHandles -> $afterHandles)"
+    $anchorPath = Join-Path $testRoot 'zzzz-PControl-Anchor.exe'
+    Copy-Item -LiteralPath $targetPath -Destination $anchorPath
+    $anchor = Start-Owned $anchorPath
+    $null = Find-Target $anchor.Id
     Start-Sleep -Milliseconds 1800
     $beforeRows = @((Invoke-Core @{command='GetProcessList'}).data)
     Assert-Test ($beforeRows.Count -eq [PControlWindowTest]::ItemCount($gui.Id)) 'GUI list reflects sorted Core snapshot'
-    $desiredTop = [Math]::Max(1, [Math]::Floor($beforeRows.Count / 2))
-    $oldTop = [PControlWindowTest]::ScrollTo($gui.Id, $desiredTop)
-    $topIdentity = $beforeRows[$oldTop]
-    $oldSelected = [Math]::Min($oldTop + 2, $beforeRows.Count - 1)
-    $selectedIdentity = $beforeRows[$oldSelected]
+    $anchorIndex = 0
+    while ($anchorIndex -lt $beforeRows.Count -and $beforeRows[$anchorIndex].pid -ne $anchor.Id) { $anchorIndex++ }
+    Assert-Test ($anchorIndex -gt 0 -and $anchorIndex -lt $beforeRows.Count) 'Stable test anchor is present away from list start'
+    $oldTop = [PControlWindowTest]::ScrollToTop($gui.Id, $anchorIndex)
+    Assert-Test ($oldTop -eq $anchorIndex) 'Stable test anchor is positioned as first visible process'
+    $oldSelected = $anchorIndex
     [PControlWindowTest]::Select($gui.Id, $oldSelected)
-    Assert-Test ([PControlWindowTest]::SelectedIndex($gui.Id) -eq $oldSelected) 'Runtime test selects a process low in the list'
+    $anchorName = $beforeRows[$anchorIndex].name
+    $anchorExecutablePath = $beforeRows[$anchorIndex].path
+    $topOffset = [PControlWindowTest]::TopOffset($gui.Id)
+    Assert-Test ([PControlWindowTest]::SelectedIndex($gui.Id) -eq $oldSelected) 'Runtime test selects a process near the bottom'
+
+    $stableSnapshot = Snapshot-Key $beforeRows
+    $stableCycles = 0
+    for ($attempt = 1; $attempt -le 20 -and $stableCycles -lt 5; $attempt++) {
+        Start-Sleep -Milliseconds 1600
+        $cycleRows = @((Invoke-Core @{command='GetProcessList'}).data)
+        $sameSnapshot = (Snapshot-Key $cycleRows) -eq $stableSnapshot
+        $cycleTop = [PControlWindowTest]::TopIndex($gui.Id)
+        $cycleSelected = [PControlWindowTest]::SelectedIndex($gui.Id)
+        $cycleOffset = [PControlWindowTest]::TopOffset($gui.Id)
+        if ($sameSnapshot) {
+            $stableCycles++
+            Assert-Test ($cycleTop -eq $oldTop -and $cycleSelected -eq $oldSelected -and
+                         $cycleOffset -eq $topOffset) "Test A unchanged refresh $stableCycles/5 (top=$oldTop/$cycleTop selected=$oldSelected/$cycleSelected offset=$topOffset/$cycleOffset)"
+        } else {
+            Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset "Test A incidental structural refresh preserves stable anchors"
+            $stableSnapshot = Snapshot-Key $cycleRows
+            $oldTop = $cycleTop
+            $oldSelected = $cycleSelected
+        }
+    }
+    Assert-Test ($stableCycles -eq 5) 'Test A observed five structurally unchanged automatic refreshes'
+    $anchorRuntime = @{pid=$anchor.Id;creationTime=$beforeRows[$anchorIndex].creationTime}
+    Assert-Test ((Invoke-Core ($anchorRuntime + @{command='SetPriority';value=0x4000})).success) 'In-place refresh test changes anchor priority'
+    $priorityDeadline = [DateTime]::UtcNow.AddSeconds(4)
+    do {
+        Start-Sleep -Milliseconds 200
+        $priorityText = [PControlWindowTest]::ItemText($gui.Id, [PControlWindowTest]::SelectedIndex($gui.Id), 2)
+    } while ($priorityText -ne 'Below Normal' -and [DateTime]::UtcNow -lt $priorityDeadline)
+    Assert-Test ($priorityText -eq 'Below Normal') 'Changed Priority cell updates in place'
+    Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset 'In-place cell update leaves viewport and selection untouched'
+
+    Assert-Test ([PControlWindowTest]::HasShowSelectionAlways($gui.Id)) 'Test B list has LVS_SHOWSELALWAYS'
+    Assert-Test ([PControlWindowTest]::FocusPriority($gui.Id)) 'Test B moves keyboard focus to Priority combo'
+    for ($cycle = 1; $cycle -le 5; $cycle++) {
+        Start-Sleep -Milliseconds 1600
+        Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset "Test B refresh $cycle/5 keeps selection with focus outside list"
+    }
+
     $scrollTargetPath = Join-Path $testRoot '000-PControl-Scroll.exe'
     Copy-Item -LiteralPath $targetPath -Destination $scrollTargetPath
     $scrollTarget = Start-Owned $scrollTargetPath
     $null = Find-Target $scrollTarget.Id
     Start-Sleep -Milliseconds 2200
     $afterRows = @((Invoke-Core @{command='GetProcessList'}).data)
-    $newTop = 0
-    while ($newTop -lt $afterRows.Count -and
-           ($afterRows[$newTop].pid -ne $topIdentity.pid -or $afterRows[$newTop].creationTime -ne $topIdentity.creationTime)) { $newTop++ }
-    $newSelected = 0
-    while ($newSelected -lt $afterRows.Count -and
-           ($afterRows[$newSelected].pid -ne $selectedIdentity.pid -or $afterRows[$newSelected].creationTime -ne $selectedIdentity.creationTime)) { $newSelected++ }
-    Assert-Test ($newTop -lt $afterRows.Count -and [PControlWindowTest]::TopIndex($gui.Id) -eq $newTop) 'Top-visible process identity survives refresh and insertion'
-    Assert-Test ($newSelected -lt $afterRows.Count -and [PControlWindowTest]::SelectedIndex($gui.Id) -eq $newSelected) 'Selected process identity survives refresh and insertion'
+    $insertedTop = [PControlWindowTest]::TopIndex($gui.Id)
+    Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset 'Test C preserves viewport and selection after process insertion'
+    Assert-Test ($insertedTop -gt $oldTop) 'Test C inserted process sorts before the viewport'
     Stop-Process -Id $scrollTarget.Id
+    Start-Sleep -Milliseconds 2200
+    Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset 'Test C preserves viewport and selection after process removal'
+
+    for ($cycle = 1; $cycle -le 20; $cycle++) {
+        Start-Sleep -Milliseconds 1600
+        Assert-Anchors $gui $anchor.Id $anchorName $anchorExecutablePath $topOffset "Test D refresh $cycle/20 has no viewport drift or selection loss"
+    }
     $target = Start-Owned $targetPath
     $row = Find-Target $target.Id
     Assert-Test ($row.creationTime -ne '0') 'New process has creation identity'
